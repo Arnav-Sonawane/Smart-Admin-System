@@ -13,7 +13,7 @@ SPAS is a robust, lightweight, Streamlit-based project management dashboard desi
 
 ## 🛠️ Tech Stack
 
-* **Frontend/UI**: [Streamlit](https://streamlit.io/) with Material Icons
+* **Frontend/UI**: [Streamlit](https://streamlit.io/)
 * **Backend/Logic**: Python
 * **Database**: SQLite (`spas.db`)
 * **Data Manipulation**: Pandas
