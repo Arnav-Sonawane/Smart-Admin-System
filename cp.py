@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 import hashlib
+import plotly.express as px
 from datetime import datetime, date
 
 def hash_password(password):
@@ -68,6 +69,14 @@ status TEXT
 )
 """)
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS project_members(
+project_id INTEGER,
+username TEXT,
+PRIMARY KEY (project_id, username)
+)
+""")
+
 conn.commit()
 
 # ---------------- TITLE ----------------
@@ -80,6 +89,7 @@ if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
     st.session_state.current_user = None
     st.session_state.role = None
+    st.session_state.username = None
 
 if not st.session_state.logged_in:
     st.header(":material/lock: Welcome")
@@ -93,12 +103,13 @@ if not st.session_state.logged_in:
 
             if submit:
                 hashed_pwd = hash_password(password)
-                cursor.execute("SELECT name, role FROM users WHERE username=? AND password=?", (username, hashed_pwd))
+                cursor.execute("SELECT name, role, username FROM users WHERE username=? AND password=?", (username, hashed_pwd))
                 user = cursor.fetchone()
                 if user:
                     st.session_state.logged_in = True
                     st.session_state.current_user = user[0]
                     st.session_state.role = user[1]
+                    st.session_state.username = user[2]
                     st.rerun()
                 else:
                     st.error("Invalid username or password")
@@ -181,8 +192,23 @@ if menu == "Dashboard":
     st.header(":material/dashboard: Project Dashboard")
 
     users = pd.read_sql("SELECT * FROM users", conn)
-    projects = pd.read_sql("SELECT * FROM projects", conn)
-    tasks = pd.read_sql("SELECT * FROM tasks", conn)
+    
+    if st.session_state.role == "Team Member":
+        projects = pd.read_sql("""
+            SELECT p.* FROM projects p 
+            JOIN project_members pm ON p.id = pm.project_id 
+            WHERE pm.username = ?
+        """, conn, params=(st.session_state.username,))
+        
+        if not projects.empty:
+            project_ids = projects["id"].tolist()
+            placeholders = ",".join(["?"] * len(project_ids))
+            tasks = pd.read_sql(f"SELECT * FROM tasks WHERE project_id IN ({placeholders})", conn, params=tuple(project_ids))
+        else:
+            tasks = pd.DataFrame(columns=["id", "project_id", "task_name", "assigned_to", "status"])
+    else:
+        projects = pd.read_sql("SELECT * FROM projects", conn)
+        tasks = pd.read_sql("SELECT * FROM tasks", conn)
 
     # --- My Tasks Section ---
     st.subheader(":material/assignment_ind: My Tasks")
@@ -214,8 +240,12 @@ if menu == "Dashboard":
     with colB:
         st.subheader(":material/pie_chart: Task Status Distribution")
         if not tasks.empty:
-            status_counts = tasks["status"].value_counts()
-            st.bar_chart(status_counts)
+            status_counts = tasks["status"].value_counts().reset_index()
+            status_counts.columns = ["Status", "Count"]
+            fig = px.pie(status_counts, values="Count", names="Status", hole=0.4,
+                         color_discrete_sequence=px.colors.qualitative.Pastel)
+            fig.update_layout(margin=dict(t=0, b=0, l=0, r=0))
+            st.plotly_chart(fig, use_container_width=True)
             
             with st.expander("View All Tasks"):
                 st.dataframe(tasks, use_container_width=True)
@@ -283,7 +313,7 @@ if menu == "Dashboard":
 
                     project_name = projects[projects["id"] == project]["name"].values[0]
 
-                    st.write(f"**{project_name}**")
+                    st.write(f"**{project_name}** - {progress*100:.1f}%")
                     st.progress(progress)
 
 # ---------------- MY PROFILE ----------------
@@ -386,6 +416,13 @@ elif menu == "Add Task":
     st.header(":material/add_task: Add Task")
 
     projects = pd.read_sql("SELECT * FROM projects", conn)
+    if st.session_state.role == "Team Member":
+        projects = pd.read_sql("""
+            SELECT p.* FROM projects p 
+            JOIN project_members pm ON p.id = pm.project_id 
+            WHERE pm.username = ?
+        """, conn, params=(st.session_state.username,))
+    
     users = pd.read_sql("SELECT * FROM users", conn)
 
     if projects.empty:
@@ -435,19 +472,36 @@ elif menu == "Manage Tasks":
 
     st.header(":material/edit_document: Manage Tasks")
 
-    tasks = pd.read_sql("SELECT * FROM tasks", conn)
-    users = pd.read_sql("SELECT * FROM users", conn)
+    projects = pd.read_sql("SELECT * FROM projects", conn)
+    
+    if st.session_state.role == "Team Member":
+        projects = pd.read_sql("""
+            SELECT p.* FROM projects p 
+            JOIN project_members pm ON p.id = pm.project_id 
+            WHERE pm.username = ?
+        """, conn, params=(st.session_state.username,))
 
-    if tasks.empty:
-        st.warning("No tasks available")
-
+    if projects.empty:
+        st.warning("No projects assigned/available")
     else:
-
-        task_id = st.selectbox(
-            "Select Task",
-            tasks["id"].tolist(),
-            format_func=lambda x: tasks[tasks["id"] == x]["task_name"].values[0]
+        sel_project_id = st.selectbox(
+            "Select Project",
+            projects["id"].tolist(),
+            format_func=lambda x: projects[projects["id"] == x]["name"].values[0],
+            key="manage_tasks_proj"
         )
+        
+        tasks = pd.read_sql("SELECT * FROM tasks WHERE project_id=?", conn, params=(int(sel_project_id),))
+        users = pd.read_sql("SELECT * FROM users", conn)
+
+        if tasks.empty:
+            st.info("No tasks for this project")
+        else:
+            task_id = st.selectbox(
+                "Select Task",
+                tasks["id"].tolist(),
+                format_func=lambda x: tasks[tasks["id"] == x]["task_name"].values[0]
+            )
         
         task_info = tasks[tasks["id"] == task_id].iloc[0]
 
@@ -502,9 +556,26 @@ elif menu == "Manage Projects" and st.session_state.role in ["Admin", "Manager"]
         
         project_info = projects[projects["id"] == project_id].iloc[0]
         
+        # Get current members
+        cursor.execute("SELECT username FROM project_members WHERE project_id=?", (int(project_id),))
+        current_members = [row[0] for row in cursor.fetchall()]
+        
+        # Get all team members for assignment
+        all_team_members = pd.read_sql("SELECT name, username FROM users WHERE role='Team Member'", conn)
+        member_options = all_team_members["username"].tolist()
+        member_display = {row["username"]: row["name"] for _, row in all_team_members.iterrows()}
+        
         with st.form("edit_project_form"):
             new_name = st.text_input("Project Name", value=project_info["name"])
             new_desc = st.text_area("Project Description", value=project_info["description"])
+            
+            # Member assignment
+            selected_members = st.multiselect(
+                "Assign Team Members",
+                options=member_options,
+                default=[m for m in current_members if m in member_options],
+                format_func=lambda x: f"{member_display[x]} ({x})"
+            )
             
             try:
                 current_deadline = datetime.strptime(project_info["deadline"], "%Y-%m-%d").date()
@@ -523,6 +594,12 @@ elif menu == "Manage Projects" and st.session_state.role in ["Admin", "Manager"]
                         "UPDATE projects SET name=?, description=?, deadline=? WHERE id=?",
                         (new_name, new_desc, new_deadline, int(project_id))
                     )
+                    
+                    # Update project members
+                    cursor.execute("DELETE FROM project_members WHERE project_id=?", (int(project_id),))
+                    for m_username in selected_members:
+                        cursor.execute("INSERT INTO project_members(project_id, username) VALUES (?,?)", (int(project_id), m_username))
+                    
                     conn.commit()
                     st.success("Project updated successfully")
                     st.rerun()
@@ -547,6 +624,13 @@ elif menu == "Task Board":
     st.header(":material/view_kanban: Task Board")
     
     projects = pd.read_sql("SELECT * FROM projects", conn)
+    if st.session_state.role == "Team Member":
+        projects = pd.read_sql("""
+            SELECT p.* FROM projects p 
+            JOIN project_members pm ON p.id = pm.project_id 
+            WHERE pm.username = ?
+        """, conn, params=(st.session_state.username,))
+    
     tasks = pd.read_sql("SELECT * FROM tasks", conn)
     
     if projects.empty:
